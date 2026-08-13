@@ -1,0 +1,20 @@
+# Dependencias do brainhack.py (BrainHack 3.0 - segmentacao do corpo caloso)
+# Instalacao:  pip install -r requirements.txt
+
+# Numerico
+numpy>=1.24
+
+# Deep learning
+torch>=2.0
+pytorch-lightning>=2.0
+
+# Imagens medicas
+monai>=1.3           # LoadImage / Orientation / SaveImage (reorientacao LAS)
+nibabel>=5.0         # leitura dos NIfTI (FA, mascaras)
+SimpleITK>=2.3       # metricas de overlap e Hausdorff
+
+# Augmentation 2D
+albumentations>=1.4
+
+# Utilidades
+tqdm>=4.65
