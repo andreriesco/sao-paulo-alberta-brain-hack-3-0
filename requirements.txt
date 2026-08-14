@@ -1,4 +1,5 @@
-# Dependencias do brainhack.py (BrainHack 3.0 - segmentacao do corpo caloso)
+# Dependencias do brainhack.py e do notebook (BrainHack 3.0 - segmentacao do
+# corpo caloso).
 # Instalacao:  pip install -r requirements.txt
 
 # Numerico
@@ -7,6 +8,7 @@ numpy>=1.24
 # Deep learning
 torch>=2.0
 pytorch-lightning>=2.0
+torchvision>=0.15      # make_grid na visualizacao de batches (so no notebook)
 
 # Imagens medicas
 monai>=1.3           # LoadImage / Orientation / SaveImage (reorientacao LAS)
@@ -15,6 +17,12 @@ SimpleITK>=2.3       # metricas de overlap e Hausdorff
 
 # Augmentation 2D
 albumentations>=1.4
+
+# Visualizacao
+matplotlib>=3.7        # figuras de FA/alvo/predicao
+
+# Logging do treino
+tensorboard>=2.9       # backend do TensorBoardLogger do Lightning
 
 # Utilidades
 tqdm>=4.65
