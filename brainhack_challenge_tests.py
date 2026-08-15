@@ -63,19 +63,12 @@ DEPENDENCIAS = "albumentations, monai, nibabel, pytorch_lightning, SimpleITK, to
 COMBINACOES = [
     ["fa"],
     ["tensor"],
-    ["tensor_inv"],
-    ["fa", "tensor_inv"],
-    ["fa", "tensor_inv", "t1"]
-    #["fa", "tensor"],
     # tensor_inv contra tensor: a mesma informacao do tensor, mas invariante a
     # rotacao da augmentation. O par a comparar e (tensor, tensor_inv) e
     # (fa+tensor, fa+tensor_inv) — ver tensor_invariants_from_channels.
-    #["tensor_inv"],
-    #["fa", "tensor_inv"],
-    #["fa", "md"],
-    #["fa", "md", "rd"],
-    #["fa", "t1"],
-    #["fa", "tensor", "t1"],
+    ["tensor_inv"],
+    ["fa", "tensor_inv"],
+    ["fa", "tensor_inv", "t1"]
 ]
 
 # Limiares de mascara de WM a testar. Cada valor e cruzado com CADA item de
