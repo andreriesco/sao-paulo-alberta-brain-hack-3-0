@@ -92,7 +92,7 @@ COMBINACOES = [
 WM_THRESHOLDS: list[float | None] = [None, 0.3, 0.5]
 
 # Argumentos extras aplicados a TODAS as combinacoes (ex.: ["--epochs", "50"]).
-EXTRA_ARGS: list[str] = ["--epochs", "50"]
+EXTRA_ARGS: list[str] = ["--epochs", "1000", "--lr", "1e-5"]
 
 # Pular combinacoes cujo comando ja aparece em test_results.txt. Util para
 # retomar uma bateria interrompida sem repetir horas de treino.

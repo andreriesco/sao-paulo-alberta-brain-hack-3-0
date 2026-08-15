@@ -1333,20 +1333,32 @@ def to_display(img, components=DEFAULT_INPUT):
     return arr[0]
 
 
-def save_triptych(plt, img, tgt, pred, index, split, out_dir):
-    """Salva FA, alvo e predicao contigua lado a lado (equivalente aos plots do notebook)."""
+def paineis(img, tgt, pred, threshold, index, split):
+    """Os quatro paineis de uma amostra: (array, titulo) na ordem de leitura.
+
+    O quarto e a predicao ja BINARIZADA no threshold escolhido — que e a
+    predicao de fato, a que as metricas medem. Os outros tres sao os do
+    notebook: entrada, alvo e a predicao continua antes do corte.
+    """
+    return [
+        (img, f"FA (entrada), {split} {index}"),
+        (tgt, "CC (alvo)"),
+        (pred, "Predicao (continua)"),
+        # `>` e nao `>=`, o mesmo criterio da compute_metrics: a figura tem que
+        # mostrar exatamente os voxels que entraram no Dice.
+        ((pred > threshold).astype(np.float32), f"Predicao (threshold={threshold:.2f})"),
+    ]
+
+
+def save_panels(plt, img, tgt, pred, threshold, index, split, out_dir):
+    """Salva os quatro paineis de UMA amostra, lado a lado."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    plt.figure(figsize=(12, 4))
-    for j, (arr, title) in enumerate(
-        [
-            (img, f"FA (entrada), {split} {index}"),
-            (tgt, "CC (alvo)"),
-            (pred, "Predicao (continua)"),
-        ]
-    ):
-        plt.subplot(1, 3, j + 1)
+    colunas = paineis(img, tgt, pred, threshold, index, split)
+    plt.figure(figsize=(4 * len(colunas), 4))
+    for j, (arr, title) in enumerate(colunas):
+        plt.subplot(1, len(colunas), j + 1)
         plt.imshow(arr, cmap="gray")
         plt.title(title)
         plt.axis("off")
@@ -1355,11 +1367,10 @@ def save_triptych(plt, img, tgt, pred, index, split, out_dir):
     plt.close()
 
 
-def save_grid(plt, amostras, split, out_dir):
-    """Salva as amostras num UNICO PNG: uma linha por amostra, 3 colunas.
+def save_grid(plt, amostras, threshold, split, out_dir):
+    """Salva as amostras num UNICO PNG: uma linha por amostra, uma coluna por painel.
 
-    E o bloco de saida do notebook inteiro em um arquivo so — as mesmas tres
-    colunas da save_triptych (entrada, alvo, predicao), empilhadas, para
+    E o bloco de saida do notebook inteiro em um arquivo so, empilhado, para
     comparar os sujeitos de uma olhada em vez de abrir um PNG por vez.
 
     `amostras` e uma lista de (img, tgt, pred, index), na ordem do split.
@@ -1367,20 +1378,18 @@ def save_grid(plt, amostras, split, out_dir):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    n_colunas = len(paineis(*amostras[0], threshold, split))
     # squeeze=False para axes ser sempre 2D, inclusive com uma amostra so.
-    # A altura acompanha o numero de linhas (4 polegadas por linha, a mesma
-    # escala da save_triptych), senao a grade achata as imagens.
+    # A altura acompanha o numero de linhas (4 polegadas por painel, a mesma
+    # escala da save_panels), senao a grade achata as imagens.
     fig, axes = plt.subplots(
-        len(amostras), 3, figsize=(12, 4 * len(amostras)), squeeze=False
+        len(amostras), n_colunas,
+        figsize=(4 * n_colunas, 4 * len(amostras)), squeeze=False,
     )
 
     for linha, (img, tgt, pred, index) in enumerate(amostras):
         for coluna, (arr, title) in enumerate(
-            [
-                (img, f"FA (entrada), {split} {index}"),
-                (tgt, "CC (alvo)"),
-                (pred, "Predicao (continua)"),
-            ]
+            paineis(img, tgt, pred, threshold, index, split)
         ):
             ax = axes[linha][coluna]
             ax.imshow(arr, cmap="gray")
@@ -1394,14 +1403,39 @@ def save_grid(plt, amostras, split, out_dir):
     print(f"Figura combinada de {split}: {caminho}")
 
 
-def predict_split(model, dataset, device, split, figures_dir=None, max_figures=6,
-                  components=DEFAULT_INPUT):
+def save_figures(dataset, tgts_np, preds_np, threshold, split, figures_dir,
+                 max_figures=6, components=DEFAULT_INPUT):
+    """Desenha as figuras do split, no threshold ja escolhido.
+
+    NOTA: roda DEPOIS da varredura, e nao dentro da predict_split. O threshold
+    da validacao so existe depois que a varredura terminou; desenhando junto com
+    a inferencia, o painel binarizado da validacao teria que usar um limiar
+    provisorio — diferente do que as metricas dela reportam.
+
+    Reabre as `max_figures` primeiras amostras em vez de guardar o split inteiro
+    na memoria. A transformada de avaliacao e deterministica (center crop), entao
+    a imagem relida e a mesma que gerou a predicao.
+    """
+    if figures_dir is None:
+        return
+    plt = load_pyplot()  # se o matplotlib faltar, as figuras ficam desligadas
+    if plt is None:
+        return
+
+    amostras = []
+    for i in range(min(max_figures, len(dataset))):
+        img, _ = dataset[i]
+        display = to_display(img, components)
+        save_panels(plt, display, tgts_np[i], preds_np[i], threshold, i, split, figures_dir)
+        amostras.append((display, tgts_np[i], preds_np[i], i))
+
+    if amostras:
+        save_grid(plt, amostras, threshold, split, figures_dir)
+
+
+def predict_split(model, dataset, device, split):
     """Roda a rede em todo o split e devolve (alvos, predicoes) como numpy."""
     tgts_np, preds_np = [], []
-    # Resolve o matplotlib uma vez: se faltar, as figuras ficam desligadas.
-    plt = load_pyplot() if figures_dir is not None else None
-    # Paineis das primeiras amostras, guardados para a figura combinada.
-    amostras = []
 
     for i in range(len(dataset)):
         img, tgt = dataset[i]
@@ -1413,15 +1447,6 @@ def predict_split(model, dataset, device, split, figures_dir=None, max_figures=6
 
         tgts_np.append(tgt.squeeze().numpy())
         preds_np.append(pred)
-
-        # A entrada so e necessaria para as figuras, entao nao acumulamos o split inteiro.
-        if plt is not None and i < max_figures:
-            display = to_display(img, components)
-            save_triptych(plt, display, tgts_np[-1], pred, i, split, figures_dir)
-            amostras.append((display, tgts_np[-1], pred, i))
-
-    if amostras:
-        save_grid(plt, amostras, split, figures_dir)
 
     print(f"{len(dataset)} amostras de {split} inferidas.")
     return tgts_np, preds_np
@@ -1895,12 +1920,9 @@ def main(argv=None):
 
 def run_eval_and_test(trained, data_module, device, args, threshold):
     """Estagios 3 e 4: validacao (com escolha do threshold) e teste."""
-    # ---- 3. Validacao: predicoes, figuras e escolha do threshold ---------
+    # ---- 3. Validacao: predicoes, escolha do threshold e figuras ---------
     if "eval" in args.stages:
-        tgts_np, preds_np = predict_split(
-            trained, data_module.val, device, "val", args.figures_dir,
-            args.max_figures, args.input
-        )
+        tgts_np, preds_np = predict_split(trained, data_module.val, device, "val")
         if args.no_threshold_sweep:
             metrics = compute_metrics(tgts_np, preds_np, threshold)
         else:
@@ -1908,14 +1930,15 @@ def run_eval_and_test(trained, data_module, device, args, threshold):
                 tgts_np, preds_np, np.arange(0.05, 1.0, 0.05)
             )
         report(metrics, threshold, "val")
+        save_figures(data_module.val, tgts_np, preds_np, threshold, "val",
+                     args.figures_dir, args.max_figures, args.input)
 
     # ---- 4. Avaliacao final no teste -------------------------------------
     if "test" in args.stages:
-        tgts_np, preds_np = predict_split(
-            trained, data_module.test, device, "test", args.figures_dir,
-            args.max_figures, args.input
-        )
+        tgts_np, preds_np = predict_split(trained, data_module.test, device, "test")
         report(compute_metrics(tgts_np, preds_np, threshold), threshold, "test")
+        save_figures(data_module.test, tgts_np, preds_np, threshold, "test",
+                     args.figures_dir, args.max_figures, args.input)
 
 
 if __name__ == "__main__":
