@@ -64,8 +64,7 @@ COMBINACOES = [
     ["fa"],
     ["tensor"],
     # tensor_inv contra tensor: a mesma informacao do tensor, mas invariante a
-    # rotacao da augmentation. O par a comparar e (tensor, tensor_inv) e
-    # (fa+tensor, fa+tensor_inv) — ver tensor_invariants_from_channels.
+    # rotacao da augmentation.
     ["tensor_inv"],
     ["fa", "tensor_inv"],
     ["fa", "tensor_inv", "t1"]
