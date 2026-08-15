@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
-"""brainhack_challenge — versao script do notebook do hands-on (BrainHack 3.0).
+"""brainhack_challenge_3d — versao 3D do script do hands-on (BrainHack 3.0).
 
-Segmentacao do corpo caloso na fatia sagital media com uma UNet 2D treinada
-com PyTorch Lightning.
+Segmentacao do corpo caloso no VOLUME inteiro com uma UNet 3D treinada com
+PyTorch Lightning. E a irma de `brainhack_challenge.py`, que resolve a mesma
+tarefa numa unica fatia sagital media com uma UNet 2D; tudo que difere entre as
+duas esta marcado com `# NOTA 3D:`.
+
+O que muda, em uma frase cada:
+
+  * o pre-processamento nao extrai mais uma fatia: recorta o volume para
+    VOLUME_SIZE^3 = 128^3 (ver CropVolume);
+  * o treino ve PATCHES de PATCH_SIZE^3 = 64^3 sorteados do volume (ver
+    RotateCropTensor3D), porque o volume inteiro com largura de canal decente
+    nao cabe numa GPU pequena; a avaliacao roda no volume 128^3 inteiro, que a
+    rede aceita por ser totalmente convolucional;
+  * a augmentation gira em torno do eixo sagital, como na versao 2D — la o giro
+    era no plano da fatia, aqui e o mesmo giro aplicado a todas as fatias de uma
+    vez, entao a correcao do campo tensorial (D -> R D R^T) vale palavra por
+    palavra;
+  * a UNet e a mesma classe com dim="3d": os blocos ja eram genericos, so o
+    upsample e o ajuste de tamanho precisavam saber o numero de eixos.
 
 A entrada da rede e uma LISTA de componentes (`--input`), concatenados como
 canais na ordem pedida — de "so a FA" (o notebook original) a combinacoes como
@@ -16,7 +33,7 @@ Cada componente se normaliza sozinho, porque as unidades nao sao comparaveis:
 FA e adimensional em [0, 1], as difusividades estao em mm^2/s e T1/b0 vem em
 unidades arbitrarias de scanner. Diferente das metricas escalares, o tensor
 preserva a orientacao das fibras — o que exige o cuidado documentado em
-`RotateCropTensor` (um campo tensorial nao gira como um campo escalar).
+`RotateCropTensor3D` (um campo tensorial nao gira como um campo escalar).
 
 `tensor_inv` e a alternativa ao `tensor`: os mesmos 6 numeros reescritos como 5
 invariantes sob a rotacao que a augmentation aplica (ver
@@ -24,52 +41,52 @@ invariantes sob a rotacao que a augmentation aplica (ver
 metricas escalares jogam fora, mas sem depender do referencial, que e o que
 obriga o `tensor` a girar junto com a imagem.
 
-O notebook `brainhack-3-0-ii-encontro-ismrm-brasil-full.ipynb` foi reorganizado
-em estagios executaveis, na mesma ordem das celulas:
+Os estagios sao os mesmos da versao 2D:
 
-    1. preprocess : le os volumes 3D (entrada + mascara CC), normaliza, extrai
-                    a fatia sagital media e salva um .npz por sujeito.
-    2. train      : treina a UNet 2D sobre as fatias salvas.
-    3. eval       : inferencia na validacao + varredura de threshold.
+    1. preprocess : le os volumes 3D (entrada + mascara CC), normaliza, recorta
+                    para 128^3 e salva um .npz por sujeito.
+    2. train      : treina a UNet 3D em patches de 64^3.
+    3. eval       : inferencia na validacao (volume inteiro) + varredura de
+                    threshold.
     4. test       : inferencia no teste com o melhor threshold.
 
 Uso tipico (tudo de uma vez, dados descobertos automaticamente):
 
-    python brainhack_challenge.py
+    python brainhack_challenge_3d.py
 
 Combinando metricas (7 canais: 1 de FA + 6 do tensor):
 
-    python brainhack_challenge.py --input fa tensor
+    python brainhack_challenge_3d.py --input fa tensor
 
 Somente treino, com os .npz ja gerados:
 
-    python brainhack_challenge.py --stages train --epochs 50
+    python brainhack_challenge_3d.py --stages train --epochs 50
 
 Smoke test rapido (1 batch de treino e 1 de validacao):
 
-    python brainhack_challenge.py --debug
+    python brainhack_challenge_3d.py --debug
 
-Diferencas em relacao ao notebook estao marcadas com `# NOTA:`.
+Custo, para dimensionar antes de rodar: cada .npz guarda 128^3 voxels em
+float32 por canal (~8 MB por canal por sujeito antes da compressao), e a
+memoria de GPU do treino e governada por --patch-size, --batch-size e
+--init-channels, nessa ordem. Se faltar memoria, o primeiro knob e
+`--precision 16-mixed`, depois --init-channels.
+
+Diferencas em relacao ao notebook estao marcadas com `# NOTA:`, e as que
+existem so por causa do 3D com `# NOTA 3D:`.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import os
 import random
-import shlex
-import shutil
-import subprocess
-import sys
 from collections import defaultdict
 from glob import glob
 from math import nan
 from pathlib import Path
 
-import albumentations as A
 import nibabel as nib
 import numpy as np
 import pytorch_lightning as pl
@@ -81,6 +98,9 @@ from monai.data import MetaTensor
 from monai.transforms import Orientation
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger, TensorBoardLogger
+# NOTA 3D: sai o Albumentations, que so trabalha em imagens 2D (HWC), e entra o
+# scipy.ndimage para girar o volume em torno do eixo sagital.
+from scipy.ndimage import rotate as ndimage_rotate
 from torch import Tensor
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
@@ -93,12 +113,23 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parent
 
 DEFAULT_LOGS_ROOT = "logs"
-DEFAULT_EXPERIMENT = "BrainhackCC"
-# Onde ficam as segmentacoes do FSL FAST (ver MaskByWM). Uma por sujeito,
-# reaproveitada por todas as combinacoes de --input.
-DEFAULT_WM_CACHE = "fsl_fast_wm"
+# NOTA 3D: nome proprio para os checkpoints 3D nao caírem na mesma pasta de
+# experimento dos 2D — o numero de canais bate, mas a arquitetura nao.
+DEFAULT_EXPERIMENT = "BrainhackCC3D"
+# Eixo sagital dos volumes (X). E em torno dele que a augmentation gira e que a
+# correcao do campo tensorial e definida (ver rotation_matrix_x).
 SAGITTAL_AXIS = 0
 MODES = ("train", "val", "test")
+
+# NOTA 3D: lado do cubo que sai do pre-processamento. Duas razoes para recortar:
+# 145x174x145 nao e multiplo de 16 (a UNet reduz 4 vezes por 2, e um lado que
+# nao seja multiplo de 16 volta do decoder com tamanho diferente do skip), e o
+# volume inteiro na resolucao original nao cabe na GPU.
+VOLUME_SIZE = 128
+# Lado do patch de treino. A rede e totalmente convolucional, entao treinar em
+# patch e avaliar no volume inteiro e a mesma rede — o patch existe so para o
+# treino caber na memoria.
+PATCH_SIZE = 16
 # Estagios do pipeline, na ordem em que rodam (ver --stages).
 STAGES = ("preprocess", "train", "eval", "test")
 
@@ -131,10 +162,6 @@ def find_data_root(start: Path, targets) -> Path:
     raise FileNotFoundError(
         f"Nenhuma pasta contendo {sorted(targets)} encontrada em {start}"
     )
-
-
-def load_nifti(path: Path) -> np.ndarray:
-    return nib.load(path).get_fdata()
 
 
 # ============================================================================
@@ -175,7 +202,7 @@ def tensor_invariants_from_channels(comp):
     """(..., 6) -> (..., 5): invariantes de D sob rotacao em torno do eixo x.
 
     Motivacao: as 6 componentes de D dependem do referencial. A augmentation
-    gira a fatia no plano (y, z), ou seja D -> R D R^T com R = rotation_matrix_x,
+    gira o volume no plano (y, z), ou seja D -> R D R^T com R = rotation_matrix_x,
     e ai as componentes se misturam — a rede precisa aprender essa invariancia
     pelos exemplos. Estes 5 canais ja sao invariantes por construcao.
 
@@ -186,11 +213,11 @@ def tensor_invariants_from_channels(comp):
     liberdade de D menos o parametro da rotacao, entao nao se perde nada alem
     da fase arbitraria.
 
-    Por que dxx importa aqui: na fatia sagital media as fibras do CC cruzam a
-    linha media, entao a direcao principal aponta para fora do plano (eixo x).
-    As outras estruturas de FA alta da fatia (fornix, cingulo) correm no plano.
-    O canal dxx/tr separa justamente esses casos — e nenhuma metrica escalar
-    (fa, md, ad, rd) consegue, porque todas dependem so dos autovalores.
+    Por que dxx importa aqui: em torno da linha media as fibras do CC a cruzam,
+    entao a direcao principal aponta ao longo do eixo x. As outras estruturas de
+    FA alta da regiao (fornix, cingulo) correm no plano sagital. O canal dxx/tr
+    separa justamente esses casos — e nenhuma metrica escalar (fa, md, ad, rd)
+    consegue, porque todas dependem so dos autovalores.
 
     Todos os canais sao de primeira ordem em difusividade (dai as raizes: um
     termo quadratico ficaria espremido perto de zero) e normalizados pelo traco,
@@ -232,7 +259,7 @@ def tensor_invariants_from_channels(comp):
 
 
 def rotation_matrix_x(angle_rad):
-    """Rotacao em torno do eixo sagital (eixo 0) = o plano (y, z) da fatia."""
+    """Rotacao em torno do eixo sagital (eixo 0) = giro no plano (y, z)."""
     c, s = np.cos(angle_rad), np.sin(angle_rad)
     return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
 
@@ -291,35 +318,12 @@ def norm_robust(x, pct=99.0):
     return np.clip(x / ref, 0.0, 1.0) if ref > 0 else x
 
 
-def load_las(path):
-    """Carrega um NIfTI e reorienta para LAS, a orientacao das metricas de difusao.
-
-    NOTA: isto NAO e defensivo, e obrigatorio. Neste dataset FA, MD, AD, RD,
-    evals, evecs e mean_b0 estao todos em LAS, mas o T1 e a mascara de CC vem em
-    orientacoes que MUDAM de sujeito para sujeito — nos 20 primeiros sujeitos
-    aparecem dez combinacoes diferentes (SAL, IPR, LPS, SPR, ...). Empilhar um
-    T1 cru como canal ao lado da FA junta dois volumes que nao estao no mesmo
-    espaco: o canal fica espelhado/transposto em relacao aos outros.
-
-    Para volumes que ja estao em LAS a reorientacao nao faz nada, entao da para
-    aplicar em todos os escalares sem pensar em qual precisa.
-
-    So serve para campos ESCALARES. Um campo vetorial ou tensorial (evecs, as
-    componentes de D) precisaria girar as componentes junto com o grid — mas
-    esses ja vem em LAS, entao nao passam por aqui.
-    """
-    nii = nib.load(path)
-    vol = np.nan_to_num(np.asarray(nii.dataobj, dtype=np.float32))
-    las = Orientation(axcodes="LAS")(MetaTensor(np.expand_dims(vol, 0), affine=nii.affine))
-    return np.ascontiguousarray(las.numpy()[0], dtype=np.float32)
-
-
 def _scalar_loader(filename, normalize):
     """Componente de 1 canal lido de um NIfTI escalar."""
 
     def load(subject_dir):
-        vol = load_las(Path(subject_dir) / filename)
-        return normalize(np.expand_dims(vol, 0))
+        vol = nib.load(Path(subject_dir) / filename).get_fdata(dtype=np.float32)
+        return normalize(np.expand_dims(np.nan_to_num(vol), 0))
 
     return load
 
@@ -357,7 +361,7 @@ def _tensor_inv_loader(subject_dir):
     """Componente de 5 canais: invariantes de D sob a rotacao da augmentation.
 
     Alternativa ao `tensor`: a mesma informacao, menos a fase da rotacao no
-    plano da fatia, num referencial que a augmentation nao mexe. Ver
+    plano sagital, num referencial que a augmentation nao mexe. Ver
     tensor_invariants_from_channels. Ja sai em [0, 1], entao nao passa pelas
     funcoes norm_*.
     """
@@ -387,7 +391,7 @@ INPUT_COMPONENTS = {
     "tensor": InputComponent(6, ["evals.nii", "evecs.nii"], _tensor_loader,
                              "as 6 componentes unicas de D"),
     "tensor_inv": InputComponent(5, ["evals.nii", "evecs.nii"], _tensor_inv_loader,
-                                 "5 invariantes de D sob a rotacao do plano da fatia"),
+                                 "5 invariantes de D sob a rotacao do plano sagital"),
     "b0": InputComponent(1, ["mean_b0.nii"], _scalar_loader("mean_b0.nii", norm_robust),
                          "b0 medio"),
     "t1": InputComponent(1, ["T1_brain_1.25.nii"],
@@ -456,22 +460,17 @@ class BrainHack3Data(Dataset):
     EVALS_FILE = "evals.nii"
     EVECS_FILE = "evecs.nii"
     CC_FILE = "cc_mask_mricloud_1.25.nii"
-    T1_FILE = "T1_brain_1.25.nii"
 
     @classmethod
-    def required_files(cls, components, wm_mask=False):
+    def required_files(cls, components):
         """NIfTI que uma pasta precisa ter para ser reconhecida como sujeito.
 
-        A FA entra sempre: mesmo quando nao e canal de entrada, e ela que
-        escolhe a fatia sagital media (ver ExtractMidSagittalSlice). O T1 entra
-        quando a mascara de WM esta ligada, mesmo que ele nao seja canal de
-        entrada — e dele que sai a segmentacao (ver MaskByWM).
+        A FA entra sempre: mesmo quando nao e canal de entrada, e ela que vai no
+        `ctx` como criterio das transformadas (ver ThresholdByFA).
         """
         arquivos = {cls.FA_FILE, cls.CC_FILE}
         for name in components:
             arquivos.update(INPUT_COMPONENTS[name].files)
-        if wm_mask:
-            arquivos.add(cls.T1_FILE)
         return arquivos
 
     def __init__(
@@ -514,7 +513,8 @@ class BrainHack3Data(Dataset):
 
     def _load_fa(self, subject_dir):
         """FA crua (sem normalizar), usada como criterio pelas transformadas."""
-        return load_las(subject_dir / BrainHack3Data.FA_FILE)
+        fa = nib.load(subject_dir / BrainHack3Data.FA_FILE).get_fdata(dtype=np.float32)
+        return np.nan_to_num(fa)
 
     def __getitem__(self, i):
         subject_id = self.subject_ids[i]
@@ -530,9 +530,9 @@ class BrainHack3Data(Dataset):
 
         if self.transform is not None:
             # ctx leva a FA junto com (x, y). Sem isso, transformadas que
-            # dependem da FA (escolher a fatia, mascarar por limiar) teriam que
-            # adivinhar onde ela esta nos canais — e nao existiria criterio
-            # nenhum para uma entrada como "--input md rd".
+            # dependem da FA (mascarar por limiar) teriam que adivinhar onde ela
+            # esta nos canais — e nao existiria criterio nenhum para uma entrada
+            # como "--input md rd".
             img, mask = self.transform(
                 img, mask, {"fa": self._load_fa(subject_dir), "subject_dir": subject_dir}
             )
@@ -550,10 +550,9 @@ class ComposeTransforms:
     """Aplica uma lista de transformadas em sequencia.
 
     Alem de (x, y), carrega um `ctx` opcional com dados do sujeito que nao sao
-    nem entrada nem alvo — hoje a FA, que serve de criterio para escolher a
-    fatia e para mascarar por limiar. As transformadas podem reescrever o ctx
-    (a extracao de fatia troca o volume de FA pela fatia correspondente), de
-    modo que ele sempre acompanha o x atual.
+    nem entrada nem alvo — hoje a FA, que serve de criterio para mascarar por
+    limiar. As transformadas podem reescrever o ctx (o recorte troca a FA pela
+    FA recortada), de modo que ele sempre acompanha o x atual.
     """
 
     def __init__(self, transforms):
@@ -575,60 +574,59 @@ class ComposeTransforms:
 # empilhamento de canais, e cada uma precisa da sua.
 
 
-class ExtractMidSagittalSlice:
-    """Extrai a fatia sagital media de volumes 3D.
+class CropVolume:
+    """Recorta o volume, centrado, para um cubo de lado `size`.
 
-    Criterio: menor FA medio entre as fatias com tecido suficiente segundo a
-    mascara de CEREBRO (aqui, fa_vol > 0). A mascara do corpo caloso (o alvo y)
-    NAO e usada: ela e o que a rede deve prever, e num volume novo nem existe.
+    NOTA 3D: e o que substitui a ExtractMidSagittalSlice da versao 2D — em vez
+    de escolher UMA fatia, o pipeline 3D fica com o volume todo, so aparado.
 
-    A FA vem do `ctx` (a FA crua do sujeito), nunca dos canais de x. Assim a
-    fatia escolhida e a MESMA independente do que foi pedido em --input — se o
-    criterio saisse dos canais, "--input md rd" nao teria criterio nenhum, e
-    "--input t1" escolheria a fatia por intensidade de T1.
+    Center crop, e nao um recorte guiado pelo alvo: a mascara de CC e o que a
+    rede deve prever, e num volume novo ela nem existe. Medido nos 144 sujeitos
+    dos tres splits, o CC ocupa [47..96] x [46..133] x [46..91] e o crop 128^3
+    de um volume 145x174x145 comeca em (8, 23, 8) — sobram pelo menos 17 voxels
+    de folga de cada lado, entao o recorte nao corta alvo de nenhum sujeito.
+
+    Volumes menores que `size` sao completados com zero, para um dataset com
+    outra grade falhar de forma visivel em vez de virar um erro de shape la no
+    meio do treino.
     """
 
-    def __init__(self, sagittal_axis=SAGITTAL_AXIS):
-        self.sagittal_axis = sagittal_axis
+    def __init__(self, size=VOLUME_SIZE):
+        self.size = int(size)
 
-    def _brain_mask(self, fa_vol, subject_dir=None):
-        # Mascara de cerebro: vem da ENTRADA, nunca do alvo.
-        # NOTA: existe um T1_brain_mask_1.25.nii por sujeito, mas usa-lo aqui
-        # mudaria a fatia escolhida em ~1 a cada 12 sujeitos em relacao ao que
-        # o notebook faz. Mantido em fa_vol > 0 de proposito; passar
-        # subject_dir ativa o outro caminho para quem quiser comparar.
-        if subject_dir is not None:
-            hits = sorted(Path(subject_dir).glob("T1_brain_mask_1.25.nii*"))
-            if hits:
-                return load_nifti(hits[0]) > 0
-        return fa_vol > 0
+    def _crop_pad(self, n):
+        """(fatia, padding) de um eixo de tamanho n para chegar em self.size."""
+        if n >= self.size:
+            inicio = (n - self.size) // 2
+            return slice(inicio, inicio + self.size), (0, 0)
+        falta = self.size - n
+        return slice(0, n), (falta // 2, falta - falta // 2)
 
-    def _find_slice_index(self, fa_vol):
-        other_axes = tuple(i for i in range(fa_vol.ndim) if i != self.sagittal_axis)
-        mask_count = self._brain_mask(fa_vol).sum(axis=other_axes)
-        fa_mean = fa_vol.mean(axis=other_axes)
-        fa_mean[mask_count <= 0.90 * mask_count.max()] = 1
-        return int(np.argmin(fa_mean))
+    def apply(self, arr, com_canal=True):
+        """Recorta os eixos ESPACIAIS de arr, preservando o eixo de canal."""
+        arr = np.asarray(arr)
+        espacial = arr.shape[1:] if com_canal else arr.shape
+        cortes, paddings = zip(*(self._crop_pad(n) for n in espacial))
+        if com_canal:
+            arr = arr[(slice(None), *cortes)]
+            paddings = ((0, 0), *paddings)
+        else:
+            arr = arr[tuple(cortes)]
+        return np.pad(arr, paddings) if any(p != (0, 0) for p in paddings) else arr
 
     def __call__(self, x, y=None, ctx=None):
         ctx = {} if ctx is None else ctx
-        fa_vol = ctx.get("fa")
-        if fa_vol is None:
-            # Sem ctx (uso solto da transformada): cai para o primeiro canal.
-            fa_vol = x[0]
-        slice_idx = self._find_slice_index(np.array(fa_vol, copy=True))
+        x = self.apply(x).astype(np.float32)
 
-        # +1 porque o eixo 0 de x e o de canais: recorta TODOS os canais.
-        x = np.take(x, slice_idx, axis=self.sagittal_axis + 1).astype(np.float32)
-        # O ctx acompanha o x: daqui para frente "fa" e a FATIA de FA.
-        ctx["fa"] = np.take(fa_vol, slice_idx, axis=self.sagittal_axis)
-        ctx["slice_idx"] = slice_idx
+        fa_vol = ctx.get("fa")
+        if fa_vol is not None:
+            # O ctx acompanha o x: daqui para frente "fa" e a FA recortada, para
+            # a ThresholdByFA seguinte poder fazer broadcast com os canais.
+            ctx["fa"] = self.apply(fa_vol, com_canal=False)
 
         if y is None:
             return x, None  # inferencia: nao ha mascara a recortar
-        cc_slice = np.take(y[0], slice_idx, axis=self.sagittal_axis)
-        y = np.expand_dims((cc_slice > 0).astype(np.float32), 0)
-        return x, y
+        return x, (self.apply(y) > 0).astype(np.float32)
 
 
 class ThresholdByFA:
@@ -640,11 +638,8 @@ class ThresholdByFA:
     adimensional e vive em [0, 1], o limiar e diretamente interpretavel (~0.2
     costuma separar substancia branca do resto).
 
-    NOTA: roda DEPOIS da extracao da fatia, de proposito. Se rodasse antes,
-    mudaria os dois criterios que a extracao usa — a FA media por fatia e a
-    mascara de cerebro `fa_vol > 0`, que viraria `fa >= limiar`, encolhendo o
-    "cerebro" para so a substancia branca. Mascarar a entrada nao deveria
-    mudar QUAL fatia e vista.
+    NOTA 3D: roda DEPOIS do recorte, de proposito — o `fa` do ctx so tem o mesmo
+    shape dos canais depois que a CropVolume aparou os dois.
     """
 
     def __init__(self, threshold):
@@ -660,172 +655,28 @@ class ThresholdByFA:
         return (x * (fa >= self.threshold)).astype(np.float32), y
 
 
-def find_fsl_fast():
-    """Caminho do executavel `fast` do FSL, ou None se nao der para achar.
-
-    Procura no PATH e, se nao achar, nos dois layouts de instalacao do FSL sob
-    $FSLDIR (o de 6.0.6+ e o anterior) — o FSLDIR costuma estar definido mesmo
-    quando o PATH nao foi exportado para a sessao.
-    """
-    caminho = shutil.which("fast")
-    if caminho:
-        return caminho
-
-    fsldir = os.environ.get("FSLDIR")
-    if fsldir:
-        for relativo in ("share/fsl/bin/fast", "bin/fast"):
-            candidato = Path(fsldir) / relativo
-            if candidato.exists():
-                return str(candidato)
-    return None
-
-
-def wm_pve_from_t1(t1_path, out_dir, fast_bin):
-    """Segmenta o T1 com o FSL FAST e devolve o mapa PVE de substancia branca.
-
-    Classes do FAST com `-t 1` (T1), em ordem crescente de intensidade:
-    pve_0 = LCR, pve_1 = cinzenta, pve_2 = BRANCA — e por isso que o arquivo
-    procurado e o _pve_2.
-
-    O resultado fica em cache no disco: o FAST leva cerca de um minuto por
-    sujeito, e o pipeline le cada sujeito de novo a cada combinacao de --input.
-    Como o cache e por sujeito (e nao por experimento), a segmentacao acontece
-    uma vez so e serve a todas as combinacoes.
-
-    NOTA: `-N` desliga a correcao de campo de bias, que e a parte cara do FAST.
-    O T1 do HCP ja vem corrigido pelo pipeline deles; num dataset que nao venha,
-    tire o -N (custa varias vezes mais tempo por sujeito).
-    """
-    out_dir = Path(out_dir)
-    # glob e nao um nome fixo: a extensao da saida depende do FSLOUTPUTTYPE
-    # (.nii.gz por padrao, .nii se o ambiente pedir).
-    existentes = sorted(out_dir.glob("t1_pve_2.nii*"))
-    if existentes:
-        return existentes[0]
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [fast_bin, "-t", "1", "-n", "3", "-N", "-o", str(out_dir / "t1"), str(t1_path)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"FSL fast falhou em {t1_path} (codigo {proc.returncode}):\n"
-            f"{(proc.stderr or proc.stdout).strip()}"
-        )
-
-    saidas = sorted(out_dir.glob("t1_pve_2.nii*"))
-    if not saidas:
-        gerados = sorted(p.name for p in out_dir.glob("t1*"))
-        raise RuntimeError(
-            f"FSL fast rodou mas nao gerou t1_pve_2 em {out_dir}. Gerados: {gerados}"
-        )
-    return saidas[0]
-
-
-class MaskByWM:
-    """Zera os voxels FORA da substancia branca, segundo o FSL FAST no T1.
-
-    Mesma ideia do ThresholdByFA — restringir a entrada ao tecido onde o CC pode
-    estar — com um criterio ANATOMICO em vez de um limiar de anisotropia. A
-    diferenca pratica: a FA tambem e baixa dentro da substancia branca onde ha
-    cruzamento de fibras (o limiar de FA come justamente essas regioes), e alta
-    em bordas ruidosas fora dela; a segmentacao do T1 nao depende da difusao,
-    entao erra em lugares diferentes.
-
-    O limiar e aplicado ao mapa PVE (fracao de branca no voxel, em [0, 1]):
-    0.5 fica com o voxel majoritariamente branco, valores menores alargam a
-    mascara para incluir a borda parcial.
-
-    A mascara vem da ENTRADA (o T1), nunca do alvo, e o criterio e o mesmo para
-    qualquer --input — inclusive um que nem inclua o T1 como canal.
-
-    NOTA: roda DEPOIS da extracao da fatia, pelo mesmo motivo do ThresholdByFA
-    (mascarar a entrada nao deveria mudar QUAL fatia e vista). Por isso recorta
-    o mapa de WM na MESMA fatia, usando o ctx["slice_idx"] que a extracao deixou.
-    """
-
-    def __init__(self, threshold, cache_root=DEFAULT_WM_CACHE, sagittal_axis=SAGITTAL_AXIS):
-        self.threshold = threshold
-        self.cache_root = Path(cache_root)
-        self.sagittal_axis = sagittal_axis
-
-        # Falha agora, e nao no meio do pre-processamento do 40o sujeito.
-        self.fast_bin = find_fsl_fast()
-        if self.fast_bin is None:
-            raise RuntimeError(
-                "A mascara de WM precisa do FSL: nao encontrei o executavel `fast` "
-                "no PATH nem em $FSLDIR. Instale o FSL (ou rode sem --wm-threshold)."
-            )
-        print(
-            f"Mascara de WM pelo FSL FAST ({self.fast_bin}), cache em {self.cache_root}. "
-            f"A primeira passada segmenta cada sujeito e demora ~1 min por sujeito."
-        )
-
-    def __call__(self, x, y=None, ctx=None):
-        ctx = {} if ctx is None else ctx
-        subject_dir = ctx.get("subject_dir")
-        if subject_dir is None:
-            raise RuntimeError(
-                "MaskByWM precisa de ctx['subject_dir'] para achar o T1 do sujeito."
-            )
-
-        subject_dir = Path(subject_dir)
-        t1 = subject_dir / BrainHack3Data.T1_FILE
-        if not t1.exists():
-            raise FileNotFoundError(
-                f"{t1} nao existe: a mascara de WM depende do T1 do sujeito."
-            )
-
-        pve = wm_pve_from_t1(t1, self.cache_root / subject_dir.name, self.fast_bin)
-        # O FAST herda o header do T1, e a orientacao do T1 varia de sujeito
-        # para sujeito neste dataset: sem o load_las a mascara sai espelhada em
-        # relacao a FA e zera o hemisferio errado (ver load_las).
-        wm = load_las(pve)
-
-        # A extracao de fatia ja rodou: pega a MESMA fatia do mapa de WM.
-        slice_idx = ctx.get("slice_idx")
-        if slice_idx is not None:
-            wm = np.take(wm, slice_idx, axis=self.sagittal_axis)
-
-        if wm.shape != x.shape[1:]:
-            raise RuntimeError(
-                f"Mapa de WM {wm.shape} nao bate com a entrada {x.shape[1:]}: o T1 "
-                f"precisa estar na mesma grade das metricas de difusao."
-            )
-
-        # x e [canal, ...] e a WM e um mapa escalar: o broadcast mascara todos
-        # os canais de forma coerente entre si.
-        ctx["wm"] = wm
-        return (x * (wm >= self.threshold)).astype(np.float32), y
-
-
-def build_preprocess_3d(sagittal_axis=SAGITTAL_AXIS, fa_threshold=None,
-                        wm_threshold=None, wm_cache_dir=DEFAULT_WM_CACHE):
-    """Cadeia salva em disco: extrair a fatia e (opcionalmente) mascarar.
-
-    As duas mascaras sao independentes e podem ser combinadas: com as duas
-    ligadas sobra a interseccao (branca segundo o T1 E anisotropica segundo a FA).
+def build_preprocess_volume(volume_size=VOLUME_SIZE, fa_threshold=None):
+    """Cadeia salva em disco: recortar o volume e (opcionalmente) mascarar.
 
     A normalizacao nao aparece aqui: cada componente ja saiu normalizado do
     seu proprio loader (ver INPUT_COMPONENTS).
     """
-    steps = [ExtractMidSagittalSlice(sagittal_axis=sagittal_axis)]
+    steps = [CropVolume(volume_size)]
     if fa_threshold is not None:
         steps.append(ThresholdByFA(fa_threshold))
-    if wm_threshold is not None:
-        steps.append(MaskByWM(wm_threshold, wm_cache_dir, sagittal_axis))
     return ComposeTransforms(steps)
 
 
 # ============================================================================
-# Pre-processamento: fatias 2D em disco
+# Pre-processamento: volumes recortados em disco
 # ============================================================================
 
 
 def preprocess(preprocess_fn, data_dir, split_dir, out_root, components=DEFAULT_INPUT, force=False):
-    """Extrai uma fatia sagital media por volume e salva em .npz.
+    """Recorta um volume por sujeito e salva em .npz.
 
-    Salvar em disco acelera o treino: o codigo passa a ler fatias 2D ja
-    normalizadas em vez do volume NIfTI original.
+    Salvar em disco acelera o treino: o codigo passa a ler volumes ja
+    normalizados e recortados em vez de remontar o tensor a cada epoca.
     """
     for mode in MODES:
         out_dir = Path(out_root) / mode
@@ -853,15 +704,19 @@ def preprocess(preprocess_fn, data_dir, split_dir, out_root, components=DEFAULT_
 
 
 # ============================================================================
-# Dataset 2D, augmentation e DataModule
+# Dataset 3D, augmentation e DataModule
 # ============================================================================
 
 
-class BrainHack3Data2D(Dataset):
-    """Tarefa bidimensional: segmentar o CC na fatia sagital media.
+class BrainHack3DataVolume(Dataset):
+    """Tarefa tridimensional: segmentar o CC no volume recortado.
 
-    A entrada pode ter 1 canal (FA) ou 6 canais (componentes de D) — o codigo
-    abaixo e o mesmo nos dois casos.
+    NOTA 3D: substitui a BrainHack3Data2D. Como o Albumentations saiu, os
+    arrays ficam em [canal, X, Y, Z] do disco ate a rede, sem a ida e volta
+    para HWC que a versao 2D precisava fazer.
+
+    A entrada pode ter 1 canal (FA) ou varios (componentes de D, combinacoes) —
+    o codigo abaixo e o mesmo em todos os casos.
     """
 
     def __init__(self, mode, processed_dir, transform=None):
@@ -877,86 +732,142 @@ class BrainHack3Data2D(Dataset):
         npz = np.load(self.dataset[i])
         # A imagem normalizada e float (com o tensor, inclusive negativa): ler
         # como uint8 zeraria tudo. A mascara continua binaria.
-        img = npz["img"].astype(np.float32)  # [canal, altura, largura]
-        tgt = npz["tgt"].astype(np.uint8).squeeze()
-
-        # NOTA: o Albumentations trabalha em HWC; os .npz estao em CHW.
-        img = np.moveaxis(img, 0, -1)
+        img = npz["img"].astype(np.float32)  # [canal, X, Y, Z]
+        tgt = npz["tgt"].astype(np.float32)  # [1, X, Y, Z]
 
         if self.transform is not None:
-            out = self.transform(image=img, mask=tgt)
-            img, tgt = out["image"], out["mask"]
+            img, tgt = self.transform(img, tgt)
 
-        # Formato esperado pela rede: [canal, altura, largura]
-        img = torch.from_numpy(np.ascontiguousarray(np.moveaxis(img, -1, 0))).float()
-        tgt = torch.from_numpy(np.ascontiguousarray(tgt)).float().unsqueeze(0)
-        return img, tgt
+        return (
+            torch.from_numpy(np.ascontiguousarray(img)).float(),
+            torch.from_numpy(np.ascontiguousarray(tgt)).float(),
+        )
 
 
-class RotateCropTensor:
-    """Rotacao + crop aleatorio consistentes com um campo tensorial.
+class RotateCropTensor3D:
+    """Rotacao + crop aleatorio 3D consistentes com um campo tensorial.
 
-    Por que nao usar A.Rotate direto: o Albumentations gira o GRID, mas nao tem
-    como saber que os 6 canais sao as componentes de um tensor e que elas
-    precisam girar junto (D' = R D R^T). Sem isso a rede treina com tensores
-    apontando para direcoes que nao existem na imagem — um campo escalar como a
-    FA nao tem esse problema, um campo tensorial tem.
+    Mesma ideia da RotateCropTensor 2D, um eixo acima. A rotacao continua sendo
+    em torno do eixo sagital — o que na versao 2D era girar a fatia no plano
+    (y, z) e aqui e girar TODAS as fatias pelo mesmo angulo, que e exatamente o
+    que o scipy.ndimage.rotate faz com axes=(y, z). Por isso a correcao do campo
+    tensorial e a mesma de la, letra por letra: D' = R D R^T com
+    R = rotation_matrix_x. Sem ela a rede treinaria com tensores apontando para
+    direcoes que nao existem na imagem.
 
-    A rotacao acontece no plano (y, z) da fatia sagital, entao a matriz 3D
-    correspondente e uma rotacao em torno do eixo x (rotation_matrix_x).
+    Verificado empiricamente, como foi feito para o Albumentations: com
+    axes=(y, z), rotate(+a) move o conteudo por R — a MESMA convencao do
+    A.Rotate(+a). (O Rotate do MONAI, por comparacao, move por R^T; a convencao
+    nao e a mesma entre bibliotecas, entao confira antes de reusar isto.)
+
+    NOTA 3D: o crop e enviesado para o alvo (`fg_prob`). Um patch de 64^3
+    sorteado uniformemente de um volume 128^3 quase nunca pega o CC, que ocupa
+    ~1% dos voxels, e o treino gastaria quase todos os passos em patches vazios.
     """
 
-    def __init__(self, limit_deg=10, crop=64, p=0.5, tensor_span=None):
+    def __init__(self, patch=PATCH_SIZE, limit_deg=10, p=0.5, fg_prob=0.5,
+                 tensor_span=None):
+        self.patch = int(patch)
         self.limit_deg = limit_deg
-        self.crop = crop
         self.p = p
+        self.fg_prob = fg_prob
         # (inicio, fim) dos canais que sao componentes de D, ou None se o
         # --input nao inclui o tensor. Com "--input fa tensor" o tensor vive em
         # (1, 7): girar o bloco errado corromperia a entrada em silencio.
         self.tensor_span = tensor_span
 
-    def __call__(self, image, mask):
-        if random.random() < self.p:
-            # O angulo e sorteado AQUI (e nao dentro do A.Rotate) para podermos
-            # aplicar exatamente a mesma rotacao nas componentes do tensor.
-            angle = random.uniform(-self.limit_deg, self.limit_deg)
-            out = A.Rotate(limit=(angle, angle), p=1.0)(image=image, mask=mask)
-            image, mask = out["image"], out["mask"]
+        # Margem para girar: um ponto do patch de lado L, depois de girar t, vem
+        # de no maximo (L/2)(cos t + sin t) do centro. Recortar o bloco com essa
+        # folga e girar SO o bloco custa ~5x menos que girar o volume inteiro, e
+        # ainda evita que o canto do patch venha do preto de fora do volume.
+        meia = self.patch / 2
+        t = np.deg2rad(self.limit_deg)
+        self.margin = int(np.ceil(meia * (np.cos(t) + np.sin(t)) - meia))
+
+    def _origem(self, tgt, bloco):
+        """Canto inicial do bloco a recortar, em cada eixo espacial."""
+        shape = np.asarray(tgt.shape[1:])
+        maximo = np.maximum(shape - np.asarray(bloco), 0)
+
+        if random.random() < self.fg_prob:
+            alvo = np.argwhere(tgt[0] > 0)
+            if len(alvo):
+                # Centra o bloco num voxel de CC sorteado; o clip devolve para
+                # dentro do volume quando o voxel esta perto da borda.
+                centro = alvo[random.randrange(len(alvo))]
+                return np.clip(centro - np.asarray(bloco) // 2, 0, maximo)
+
+        return np.array([random.randint(0, int(m)) for m in maximo])
+
+    def __call__(self, img, tgt):
+        girar = random.random() < self.p
+        # O angulo e sorteado AQUI para podermos aplicar exatamente a mesma
+        # rotacao as componentes do tensor.
+        angle = random.uniform(-self.limit_deg, self.limit_deg) if girar else 0.0
+        margem = self.margin if girar else 0
+
+        # A rotacao e em torno de x, entao so os eixos y e z precisam da margem.
+        bloco = (self.patch, self.patch + 2 * margem, self.patch + 2 * margem)
+        origem = self._origem(tgt, bloco)
+        corte = (slice(None), *(slice(i, i + b) for i, b in zip(origem, bloco)))
+        img, tgt = img[corte], tgt[corte]
+
+        if girar:
+            # Plano do giro: os dois eixos espaciais que sobram tirando o
+            # sagital, +1 por causa do eixo de canal do array [C, X, Y, Z].
+            plano = tuple(i + 1 for i in range(3) if i != SAGITTAL_AXIS)
+            # order=1 na imagem (e continua) e order=0 no alvo (tem que
+            # continuar binario).
+            img = ndimage_rotate(img, angle, axes=plano, reshape=False, order=1,
+                                 mode="nearest")
+            tgt = ndimage_rotate(tgt, angle, axes=plano, reshape=False, order=0,
+                                 mode="nearest")
             if self.tensor_span is not None:
-                # Verificado empiricamente: A.Rotate(+a) move o conteudo por R.
-                # (O Rotate do MONAI, por comparacao, move por R^T — a convencao
-                # nao e a mesma entre bibliotecas, entao confira antes de
-                # reusar isto em outro lugar.)
                 i, j = self.tensor_span
-                image = np.ascontiguousarray(image)
-                image[..., i:j] = rotate_tensor_channels(
-                    image[..., i:j], rotation_matrix_x(np.deg2rad(angle))
+                comp = rotate_tensor_channels(
+                    np.moveaxis(img[i:j], 0, -1), rotation_matrix_x(np.deg2rad(angle))
                 )
-        return A.RandomCrop(width=self.crop, height=self.crop, p=1.0)(
-            image=image, mask=mask
-        )
+                img[i:j] = np.moveaxis(comp, -1, 0)
+            # Joga a margem fora: o miolo e a parte do bloco que nao viu borda
+            # durante a interpolacao.
+            miolo = (slice(None), slice(None),
+                     slice(margem, margem + self.patch),
+                     slice(margem, margem + self.patch))
+            img, tgt = img[miolo], tgt[miolo]
+
+        return img, tgt
 
 
-def get_transform(transform_str: str, components=DEFAULT_INPUT):
+class CenterCrop3D:
+    """Center crop de imagem e alvo para um cubo de lado `size`."""
+
+    def __init__(self, size):
+        self.crop = CropVolume(size)
+
+    def __call__(self, img, tgt):
+        return self.crop.apply(img), self.crop.apply(tgt)
+
+
+def get_transform(transform_str: str, components=DEFAULT_INPUT, patch=PATCH_SIZE):
     """Factory de transformacoes (None = sem augmentation).
 
     A string de entrada controla qual objeto de transformada e instanciado, o
     que facilita a reproducibilidade: `transform_str` e um hiperparametro.
     `components` diz onde estao os canais do tensor, quando ha algum.
+
+    NOTA 3D: o padrao da avaliacao e None, e nao um center crop como na versao
+    2D — o volume ja sai do pre-processamento no tamanho final, e a rede, sendo
+    totalmente convolucional, aceita o volume inteiro mesmo tendo treinado em
+    patches. "center_crop" continua disponivel para avaliar em patch quando o
+    volume inteiro nao couber na memoria.
     """
     if transform_str == "rotate_crop":
-        # NOTA: era A.Compose([A.Rotate(...), A.RandomCrop(...)]). Virou uma
-        # classe propria porque a rotacao precisa girar tambem as componentes.
-        return RotateCropTensor(
-            limit_deg=10, crop=64, p=0.5,
+        return RotateCropTensor3D(
+            patch=patch, limit_deg=10, p=0.5, fg_prob=0.5,
             tensor_span=channel_layout(components).get("tensor"),
         )
     if transform_str == "center_crop":
-        return A.Compose(
-            [
-                A.CenterCrop(width=128, height=128),
-            ]
-        )
+        return CenterCrop3D(patch)
     return None
 
 
@@ -974,29 +885,44 @@ class BrainHack3DataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         componentes = tuple(self.hparams.input_components)
-        train_t = get_transform(self.hparams.train_transform_str, componentes)
-        eval_t = get_transform(self.hparams.eval_transform_str, componentes)
+        patch = self.hparams.patch_size
+        train_t = get_transform(self.hparams.train_transform_str, componentes, patch)
+        eval_t = get_transform(self.hparams.eval_transform_str, componentes, patch)
         processed_dir = self.hparams.processed_dir
-        self.train = BrainHack3Data2D("train", processed_dir, transform=train_t)
-        self.val = BrainHack3Data2D("val", processed_dir, transform=eval_t)
-        self.test = BrainHack3Data2D("test", processed_dir, transform=eval_t)
+        self.train = BrainHack3DataVolume("train", processed_dir, transform=train_t)
+        self.val = BrainHack3DataVolume("val", processed_dir, transform=eval_t)
+        self.test = BrainHack3DataVolume("test", processed_dir, transform=eval_t)
 
-    def _loader(self, dataset, shuffle):
+    def _loader(self, dataset, shuffle, batch_size=None, drop_last=False):
         return DataLoader(
             dataset,
-            batch_size=self.hparams.batch_size,
+            batch_size=batch_size or self.hparams.batch_size,
             num_workers=self.hparams.nworkers,
             shuffle=shuffle,
+            drop_last=drop_last,
         )
 
     def train_dataloader(self):
-        return self._loader(self.train, shuffle=True)
+        # NOTA 3D: drop_last no TREINO. Com 115 amostras e batch 2, a ultima
+        # batch da epoca tem uma amostra so, e o BatchNorm em modo treino exige
+        # mais de um valor por canal: no fundo do encoder o patch ja esta
+        # reduzido 16x, entao com --patch-size 16 sobra 1x1x1 por amostra e a
+        # epoca morre na ultima batch. Descartar a sobra custa menos de uma
+        # amostra por epoca, que o shuffle redistribui na epoca seguinte.
+        # (So o treino: a avaliacao roda com o BatchNorm em modo eval, que usa
+        # as running stats e aceita batch 1.)
+        return self._loader(
+            self.train, shuffle=True, drop_last=len(self.train) > self.hparams.batch_size
+        )
 
+    # NOTA 3D: avaliacao com batch 1. O treino ve patches de 64^3, mas aqui
+    # passa o volume 128^3 inteiro — 8x mais voxels por amostra — e empilhar
+    # dois deles no mesmo batch e o que estoura a memoria da GPU primeiro.
     def val_dataloader(self):
-        return self._loader(self.val, shuffle=False)
+        return self._loader(self.val, shuffle=False, batch_size=1)
 
     def test_dataloader(self):
-        return self._loader(self.test, shuffle=False)
+        return self._loader(self.test, shuffle=False, batch_size=1)
 
 
 # ============================================================================
@@ -1009,27 +935,32 @@ def dice_coeff(
 ):
     """Coeficiente de Dice entre a entrada e o alvo: 2x overlap / uniao.
 
-    Durante o treino podemos calcular o Dice por imagem e tirar a media, ou
+    Durante o treino podemos calcular o Dice por amostra e tirar a media, ou
     considerar o batch inteiro de uma vez (reduce_batch_first).
+
+    NOTA 3D: a versao 2D descia recursivamente ate um tensor de DUAS dimensoes,
+    o que aqui daria um Dice por FATIA do patch. Isso nao seria so uma media
+    diferente: a maioria das fatias de um patch nao tem CC nenhum, e o ramo de
+    "conjuntos vazios" devolve 1.0 para cada uma delas — a perda desapareceria
+    debaixo de fatias vazias perfeitas. Achatar tudo menos o batch da
+    exatamente o mesmo numero da versao 2D (la sobrava so o eixo de canal, de
+    tamanho 1) e o numero certo em 3D.
     """
     assert input.size() == target.size()
-    if input.dim() == 2 and reduce_batch_first:
+    if input.dim() < 2 and reduce_batch_first:
         raise ValueError(f"Dice: tensor sem batch (shape {input.shape})")
 
-    # Duas dimensoes (ou batch inteiro de uma vez): Dice sobre os valores linearizados.
-    if input.dim() == 2 or reduce_batch_first:
-        inter = torch.dot(input.reshape(-1), target.reshape(-1))
-        sets_sum = torch.sum(input) + torch.sum(target)
-        if sets_sum.item() == 0:
-            sets_sum = 2 * inter
-        return (2 * inter + epsilon) / (sets_sum + epsilon)
+    # Uma linha por amostra do batch (ou uma linha so, com reduce_batch_first).
+    grupos = 1 if reduce_batch_first or input.dim() < 2 else input.shape[0]
+    flat_input = input.reshape(grupos, -1)
+    flat_target = target.reshape(grupos, -1)
 
-    # Mais de duas dimensoes: Dice para cada elemento do batch.
-    dice = 0
-    for i in range(input.shape[0]):
-        dice += dice_coeff(input[i, ...], target[i, ...])
+    inter = (flat_input * flat_target).sum(dim=1)
+    sets_sum = flat_input.sum(dim=1) + flat_target.sum(dim=1)
+    # Alvo e predicao vazios: Dice 1, como no notebook (sets_sum = 2 * inter).
+    sets_sum = torch.where(sets_sum == 0, 2 * inter, sets_sum)
 
-    return dice / input.shape[0]
+    return ((2 * inter + epsilon) / (sets_sum + epsilon)).mean()
 
 
 # ============================================================================
@@ -1077,15 +1008,26 @@ class DoubleConv(nn.Module):
 class Up(nn.Module):
     def __init__(self, in_ch, out_ch, norm, dim):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, align_corners=True, mode="bilinear")
+        # NOTA 3D: "bilinear" so vale para entradas de 4 dimensoes; o
+        # equivalente para volumes e "trilinear".
+        self.up = nn.Upsample(
+            scale_factor=2, align_corners=True,
+            mode="trilinear" if dim == "3d" else "bilinear",
+        )
         self.conv = DoubleConv(in_ch, out_ch, norm, reduce=False, dim=dim)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
         # Ajuste de tamanho quando as dimensoes nao batem apos o upsample.
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
-        x1 = F.pad(x1, (diffY // 2, diffY - diffY // 2, diffX // 2, diffX - diffX // 2))
+        # NOTA 3D: generico no numero de eixos espaciais (2 em 2D, 3 em 3D). O
+        # F.pad consome os eixos de tras para frente, dai o reversed — a versao
+        # 2D montava o par (diffY, diffX) na ordem trocada, o que passava
+        # despercebido porque as fatias de treino e avaliacao eram quadradas.
+        pad = []
+        for eixo in reversed(range(2, x2.dim())):
+            diff = x2.size(eixo) - x1.size(eixo)
+            pad.extend([diff // 2, diff - diff // 2])
+        x1 = F.pad(x1, pad)
         return self.conv(torch.cat([x2, x1], dim=1))
 
 
@@ -1163,7 +1105,7 @@ class CCSegmentation(pl.LightningModule):
             n_channels=self.hparams.nin,
             n_classes=self.hparams.nout,
             norm=True,
-            dim="2d",
+            dim="3d",  # NOTA 3D: unica mudanca na arquitetura (Conv3d, BatchNorm3d).
             init_channel=self.hparams.init_channels,
         )
         self.bce = nn.BCEWithLogitsLoss()
@@ -1313,11 +1255,11 @@ def load_pyplot():
 
 
 def to_display(img, components=DEFAULT_INPUT):
-    """Mapa escalar para a figura, escolhido pelo layout de canais.
+    """Volume escalar (X, Y, Z) para a figura, escolhido pelo layout de canais.
 
-    Com mais de um canal nao existe "a imagem" para mostrar — um img.squeeze()
-    daria (C, H, W) e quebraria o imshow. Preferimos a FA (se for um dos
-    canais), depois a FA recalculada do tensor, e por ultimo o primeiro canal.
+    Com mais de um canal nao existe "a imagem" para mostrar. Preferimos a FA (se
+    for um dos canais), depois a FA recalculada do tensor, e por ultimo o
+    primeiro canal.
     """
     arr = img.numpy() if isinstance(img, torch.Tensor) else np.asarray(img)
     layout = channel_layout(components)
@@ -1328,22 +1270,39 @@ def to_display(img, components=DEFAULT_INPUT):
         return fa_from_channels(np.moveaxis(arr[i:j], 0, -1))
     if "tensor_inv" in layout:
         # Canal 0 = dxx/tr, a fracao da difusao que atravessa o plano sagital —
-        # justamente o que destaca o CC na fatia.
+        # justamente o que destaca o CC.
         return arr[layout["tensor_inv"][0]]
     return arr[0]
 
 
+def sagittal_index(tgt):
+    """Fatia sagital a mostrar na figura: a de maior area de CC no alvo.
+
+    NOTA 3D: olhar o alvo aqui e inofensivo porque SO a figura usa este indice —
+    nenhuma decisao do pipeline (recorte, treino, metricas) depende dele. Sem
+    alvo nenhum, cai no meio do volume.
+    """
+    area = np.asarray(tgt).sum(axis=(1, 2))
+    return int(np.argmax(area)) if area.max() > 0 else len(area) // 2
+
+
 def save_triptych(plt, img, tgt, pred, index, split, out_dir):
-    """Salva FA, alvo e predicao contigua lado a lado (equivalente aos plots do notebook)."""
+    """Salva entrada, alvo e predicao contigua lado a lado, numa fatia sagital.
+
+    NOTA 3D: os tres paineis mostram a MESMA fatia do volume (a de maior CC no
+    alvo), senao a comparacao visual nao diria nada.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    k = sagittal_index(tgt)
 
     plt.figure(figsize=(12, 4))
     for j, (arr, title) in enumerate(
         [
-            (img, f"FA (entrada), {split} {index}"),
-            (tgt, "CC (alvo)"),
-            (pred, "Predicao (continua)"),
+            (img[k], f"Entrada, {split} {index} (sagital {k})"),
+            (tgt[k], "CC (alvo)"),
+            (pred[k], "Predicao (continua)"),
         ]
     ):
         plt.subplot(1, 3, j + 1)
@@ -1355,73 +1314,37 @@ def save_triptych(plt, img, tgt, pred, index, split, out_dir):
     plt.close()
 
 
-def save_grid(plt, amostras, split, out_dir):
-    """Salva as amostras num UNICO PNG: uma linha por amostra, 3 colunas.
-
-    E o bloco de saida do notebook inteiro em um arquivo so — as mesmas tres
-    colunas da save_triptych (entrada, alvo, predicao), empilhadas, para
-    comparar os sujeitos de uma olhada em vez de abrir um PNG por vez.
-
-    `amostras` e uma lista de (img, tgt, pred, index), na ordem do split.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # squeeze=False para axes ser sempre 2D, inclusive com uma amostra so.
-    # A altura acompanha o numero de linhas (4 polegadas por linha, a mesma
-    # escala da save_triptych), senao a grade achata as imagens.
-    fig, axes = plt.subplots(
-        len(amostras), 3, figsize=(12, 4 * len(amostras)), squeeze=False
-    )
-
-    for linha, (img, tgt, pred, index) in enumerate(amostras):
-        for coluna, (arr, title) in enumerate(
-            [
-                (img, f"FA (entrada), {split} {index}"),
-                (tgt, "CC (alvo)"),
-                (pred, "Predicao (continua)"),
-            ]
-        ):
-            ax = axes[linha][coluna]
-            ax.imshow(arr, cmap="gray")
-            ax.set_title(title)
-            ax.axis("off")
-
-    fig.tight_layout()
-    caminho = out_dir / f"{split}_grid.png"
-    fig.savefig(caminho, dpi=110)
-    plt.close(fig)
-    print(f"Figura combinada de {split}: {caminho}")
-
-
 def predict_split(model, dataset, device, split, figures_dir=None, max_figures=6,
                   components=DEFAULT_INPUT):
     """Roda a rede em todo o split e devolve (alvos, predicoes) como numpy."""
     tgts_np, preds_np = [], []
     # Resolve o matplotlib uma vez: se faltar, as figuras ficam desligadas.
     plt = load_pyplot() if figures_dir is not None else None
-    # Paineis das primeiras amostras, guardados para a figura combinada.
-    amostras = []
 
     for i in range(len(dataset)):
         img, tgt = dataset[i]
 
         # torch.no_grad() desabilita gradientes (so necessarios no treino):
         # economiza memoria e tempo.
+        #
+        # NOTA: o sigmoid nao esta na rede (CCSegmentation.forward devolve
+        # LOGITS, para a BCEWithLogitsLoss do treino), entao ele precisa entrar
+        # aqui: e o que poe a predicao em [0, 1], a faixa em que os thresholds
+        # da varredura significam probabilidade. Sem ele, "threshold=0.05"
+        # corta de fato em sigmoid(0.05) = 0.51, e a varredura de 0.05 a 0.95
+        # cobre apenas 0.51..0.72 de probabilidade.
         with torch.no_grad():
-            pred = model(img.unsqueeze(0).to(device)).cpu().squeeze().numpy()
+            logits = model(img.unsqueeze(0).to(device))
+            pred = torch.sigmoid(logits).cpu().squeeze().numpy()
 
         tgts_np.append(tgt.squeeze().numpy())
         preds_np.append(pred)
 
         # A entrada so e necessaria para as figuras, entao nao acumulamos o split inteiro.
         if plt is not None and i < max_figures:
-            display = to_display(img, components)
-            save_triptych(plt, display, tgts_np[-1], pred, i, split, figures_dir)
-            amostras.append((display, tgts_np[-1], pred, i))
-
-    if amostras:
-        save_grid(plt, amostras, split, figures_dir)
+            save_triptych(
+                plt, to_display(img, components), tgts_np[-1], pred, i, split, figures_dir
+            )
 
     print(f"{len(dataset)} amostras de {split} inferidas.")
     return tgts_np, preds_np
@@ -1544,88 +1467,6 @@ def sweep_threshold(tgts_np, preds_np, thresholds, label="cc"):
 
 
 # ============================================================================
-# Registro dos resultados
-# ============================================================================
-#
-# O mesmo relatorio que aparece na tela vai para <experimento>/results.txt, no
-# MESMO formato de bloco que o brainhack_challenge_tests.py usa no
-# test_results.txt (comando, resultados, separador). Assim o resultado fica
-# junto do que o produziu — checkpoint, curvas do TensorBoard e figuras — e uma
-# rodada solta, fora da bateria, tambem deixa registro.
-
-RESULTS_FILENAME = "results.txt"
-SEPARADOR = "-" * 79
-
-# Onde o relatorio comeca: os mesmos marcadores que o test_results.txt usa. Sem
-# varredura (--no-threshold-sweep) o primeiro e o relatorio da validacao.
-RESULT_MARKERS = (
-    "Varredura de threshold na validacao",
-    "[val] threshold=",
-)
-
-
-class TeeText(io.TextIOBase):
-    """Repassa o texto para a tela e guarda uma copia.
-
-    O relatorio precisa ir aos dois lugares: continuar aparecendo ao vivo (a
-    bateria de testes le a saida do processo) e virar arquivo no fim.
-    """
-
-    def __init__(self, destino):
-        self.destino = destino
-        self.pedacos = []
-
-    def write(self, texto):
-        self.pedacos.append(texto)
-        return self.destino.write(texto)
-
-    def flush(self):
-        self.destino.flush()
-
-    def getvalue(self):
-        return "".join(self.pedacos)
-
-
-def trim_to_report(texto):
-    """Recorta o trecho de resultados, como o brainhack_challenge_tests.py faz.
-
-    Sem isto o bloco comecaria em linhas de servico (checkpoint carregado,
-    caminho das figuras) que nao sao resultado. Se nenhum marcador aparece
-    (ex.: so `--stages test`), guarda o que houver.
-    """
-    linhas = texto.splitlines()
-    for i, linha in enumerate(linhas):
-        if any(linha.lstrip().startswith(m) for m in RESULT_MARKERS):
-            return "\n".join(linhas[i:]).strip("\n")
-    return texto.strip("\n")
-
-
-def save_results(texto, experiment_dir, argv=None):
-    """Anexa o bloco de resultados ao results.txt do experimento.
-
-    Anexa, nunca sobrescreve: rodar o eval de novo acrescenta um bloco em vez de
-    apagar o anterior, e os blocos ficam em ordem cronologica.
-    """
-    resultados = trim_to_report(texto)
-    if not resultados:
-        return None
-
-    argv = sys.argv[1:] if argv is None else list(argv)
-    comando = "python " + shlex.join([Path(sys.argv[0]).name, *argv])
-
-    destino = Path(experiment_dir)
-    destino.mkdir(parents=True, exist_ok=True)
-    caminho = destino / RESULTS_FILENAME
-    with open(caminho, "a") as f:
-        f.write(
-            f"Input command:\n\n{comando}\n\n"
-            f"Results:\n\n{resultados}\n\n"
-            f"{SEPARADOR}\n\n"
-        )
-    return caminho
-
-
-# ============================================================================
 # CLI
 # ============================================================================
 
@@ -1640,7 +1481,8 @@ def build_hparams(args, processed_dir):
         "nworkers": args.workers,
         "input_components": list(args.input),
         "fa_threshold": args.fa_threshold,
-        "wm_threshold": args.wm_threshold,
+        "volume_size": args.volume_size,
+        "patch_size": args.patch_size,
         # nin acompanha a entrada escolhida: 1 (FA) ou 6 (componentes de D).
         "nin": n_input_channels(args.input),
         "nout": 1,
@@ -1659,7 +1501,7 @@ def build_hparams(args, processed_dir):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Segmentacao do corpo caloso na fatia sagital media (BrainHack 3.0).",
+        description="Segmentacao 3D do corpo caloso no volume (BrainHack 3.0).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -1708,23 +1550,9 @@ def parse_args(argv=None):
         "(ex.: 0.2). Vale para os dois modos de --input.",
     )
     p.add_argument(
-        "--wm-threshold",
-        type=float,
-        default=None,
-        help="Se informado, zera na entrada os voxels fora da substancia branca "
-        "(ex.: 0.5). A mascara sai do FSL FAST sobre o T1 do sujeito, no mapa "
-        "PVE de branca; exige o FSL instalado. Combinavel com --fa-threshold.",
-    )
-    p.add_argument(
-        "--wm-cache-dir",
-        default=DEFAULT_WM_CACHE,
-        help="Onde guardar as segmentacoes do FSL FAST (uma por sujeito, "
-        "reaproveitada entre experimentos).",
-    )
-    p.add_argument(
         "--processed-dir",
         default=None,
-        help="Saida das fatias .npz (padrao: depende de --input).",
+        help="Saida dos volumes .npz (padrao: depende de --input).",
     )
     p.add_argument("--logs-root", default=DEFAULT_LOGS_ROOT, help="Raiz dos logs/checkpoints.")
     p.add_argument(
@@ -1733,16 +1561,31 @@ def parse_args(argv=None):
         help=f"Padrao: {DEFAULT_EXPERIMENT}_<input>.",
     )
     p.add_argument("--force-preprocess", action="store_true", help="Reprocessa mesmo se os .npz existirem.")
-    p.add_argument("--sagittal-axis", type=int, default=SAGITTAL_AXIS)
+    # NOTA 3D: sai o --sagittal-axis (nao ha mais fatia a escolher) e entram os
+    # dois tamanhos que definem o pipeline 3D.
+    p.add_argument(
+        "--volume-size",
+        type=int,
+        default=VOLUME_SIZE,
+        help="Lado do cubo salvo pelo pre-processamento. Precisa ser multiplo de 16.",
+    )
+    p.add_argument(
+        "--patch-size",
+        type=int,
+        default=PATCH_SIZE,
+        help="Lado do patch de treino, sorteado do volume. Multiplo de 16.",
+    )
 
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=10)
-    p.add_argument("--lr", type=float, default=5e-5)
+    # NOTA 3D: batch e largura menores que na versao 2D. Um patch 64^3 tem 16x
+    # mais voxels que uma fatia 64^2, e a memoria da GPU e o limite.
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--init-channels", type=int, default=32)
+    p.add_argument("--init-channels", type=int, default=16)
     p.add_argument("--precision", default="32")
     p.add_argument("--train-transform", default="rotate_crop")
-    p.add_argument("--eval-transform", default="center_crop")
+    p.add_argument("--eval-transform", default="none")
     p.add_argument("--debug", action="store_true", help="fast_dev_run: 1 batch de treino/validacao.")
     p.add_argument("--seed", type=int, default=42)
 
@@ -1752,16 +1595,30 @@ def parse_args(argv=None):
         action="store_true",
         help="Nao varre thresholds na validacao; usa --threshold.",
     )
-    p.add_argument(
-        "--figures-dir",
-        default=None,
-        help="Onde salvar os PNGs das predicoes. Padrao: <logs-root>/<experimento>/figures.",
-    )
-    p.add_argument("--no-figures", action="store_true", help="Nao salva figura nenhuma.")
+    p.add_argument("--figures-dir", default=None, help="Se informado, salva PNGs das predicoes.")
     p.add_argument("--max-figures", type=int, default=6)
     p.add_argument("--checkpoint", default=None, help="Checkpoint para eval/test (padrao: o mais recente).")
 
     args = p.parse_args(argv)
+    # A UNet reduz a resolucao 4 vezes por 2: um lado que nao seja multiplo de
+    # 16 volta do decoder com tamanho diferente do skip.
+    for nome, valor in (("--volume-size", args.volume_size), ("--patch-size", args.patch_size)):
+        if valor % 16:
+            p.error(f"{nome}={valor} precisa ser multiplo de 16.")
+    if args.patch_size > args.volume_size:
+        p.error(f"--patch-size ({args.patch_size}) nao cabe em --volume-size ({args.volume_size}).")
+    # O BatchNorm em modo treino precisa de mais de um valor por canal. No fundo
+    # do encoder (4 reducoes por 2) cada amostra contribui com (patch/16)^3
+    # voxels, entao quem tem que passar de 1 e batch x (patch/16)^3. Conferir
+    # aqui evita descobrir isso com um ValueError no meio da primeira epoca.
+    voxels_no_fundo = (args.patch_size // 16) ** 3
+    if args.batch_size * voxels_no_fundo < 2:
+        p.error(
+            f"--batch-size {args.batch_size} com --patch-size {args.patch_size} deixa so "
+            f"{args.batch_size * voxels_no_fundo} valor por canal no fundo do encoder, e o "
+            f"BatchNorm precisa de mais de um. Aumente --batch-size ou --patch-size."
+        )
+
     pedidos = set(STAGES) if "all" in args.stages else set(args.stages)
     # Ordem canonica: "--stages test eval" nao pode avaliar antes de escolher o threshold.
     args.stages = [stage for stage in STAGES if stage in pedidos]
@@ -1769,7 +1626,7 @@ def parse_args(argv=None):
     if args.precision.isdigit():
         args.precision = int(args.precision)
     # Defaults que dependem de --input: pasta dos .npz e nome do experimento.
-    # Separados por entrada para que trocar --input nao reaproveite fatias nem
+    # Separados por entrada para que trocar --input nao reaproveite volumes nem
     # checkpoints da entrada anterior (o numero de canais nem bate). O limiar
     # entra no nome pelo mesmo motivo: ele muda o conteudo dos .npz sem mudar a
     # contagem de arquivos, e o preprocess pula quando a contagem ja bate.
@@ -1777,22 +1634,14 @@ def parse_args(argv=None):
     sufixo = input_tag(args.input)
     if args.fa_threshold is not None:
         sufixo += f"_th{args.fa_threshold:g}"
-    if args.wm_threshold is not None:
-        sufixo += f"_wm{args.wm_threshold:g}"
     if args.processed_dir is None:
-        args.processed_dir = f"preprocessed_cc_{sufixo}"
+        # NOTA 3D: prefixo proprio. As pastas preprocessed_cc_* guardam as
+        # FATIAS da versao 2D; reusa-las aqui daria um erro de shape so no
+        # primeiro conv (e a pasta preprocessed_cc_3d, de uma tentativa
+        # anterior, guarda volumes inteiros, sem recorte).
+        args.processed_dir = f"preprocessed_cc_3d_{sufixo}"
     if args.experiment_name is None:
         args.experiment_name = f"{DEFAULT_EXPERIMENT}_{sufixo}"
-
-    # NOTA: as figuras vao, por padrao, para dentro do diretorio do experimento
-    # — ao lado dos checkpoints e dos eventos do TensorBoard. Assim toda rodada
-    # deixa registrado o que ela previu, sem depender de lembrar da flag, e as
-    # figuras de entradas diferentes nao se misturam (o nome do experimento ja
-    # carrega o --input e as mascaras).
-    if args.no_figures:
-        args.figures_dir = None
-    elif args.figures_dir is None:
-        args.figures_dir = str(Path(args.logs_root) / args.experiment_name / "figures")
     return args
 
 
@@ -1815,17 +1664,11 @@ def main(argv=None):
             data_dir = Path(args.data_dir)
         else:
             data_dir = find_data_root(
-                Path(args.search_root),
-                BrainHack3Data.required_files(
-                    args.input, wm_mask=args.wm_threshold is not None
-                ),
+                Path(args.search_root), BrainHack3Data.required_files(args.input)
             )
         print(f"\nDATA_DIR: {data_dir}")
         preprocess(
-            build_preprocess_3d(
-                args.sagittal_axis, args.fa_threshold,
-                args.wm_threshold, args.wm_cache_dir,
-            ),
+            build_preprocess_volume(args.volume_size, args.fa_threshold),
             data_dir=data_dir,
             split_dir=args.split_dir,
             out_root=processed_dir,
@@ -1833,7 +1676,7 @@ def main(argv=None):
             force=args.force_preprocess,
         )
 
-    # Os estagios que leem as fatias usam sempre os datasets do DataModule, para
+    # Os estagios que leem os volumes usam sempre os datasets do DataModule, para
     # a avaliacao nao poder divergir do pre-processamento visto no treino.
     stages_com_dados = [s for s in args.stages if s != "preprocess"]
     if not stages_com_dados:
@@ -1851,15 +1694,25 @@ def main(argv=None):
             )
         print(f"{mode}: {n} amostras")
 
-    # Os .npz nao guardam qual entrada os gerou. Sem esta checagem, apontar
-    # --processed-dir para a pasta da outra entrada so falharia la na frente,
-    # como um erro de shape no primeiro conv.
-    canais = data_module.train[0][0].shape[0]
+    # Os .npz nao guardam nem qual entrada nem qual recorte os gerou. Sem esta
+    # checagem, apontar --processed-dir para a pasta de outra entrada (ou para
+    # as fatias 2D do outro script) so falharia la na frente, como um erro de
+    # shape no primeiro conv. Le do disco, e nao do dataset, para a resposta nao
+    # depender da transformada de avaliacao em uso.
+    img0 = np.load(data_module.val.dataset[0])["img"]
+    canais, volume = img0.shape[0], tuple(img0.shape[1:])
     if canais != hparams["nin"]:
         raise RuntimeError(
             f"{processed_dir} tem {canais} canais, mas --input {input_tag(args.input)} espera "
             f"{hparams['nin']}. Rode 'preprocess' (com --force-preprocess se a pasta "
             f"ja existir) ou aponte --processed-dir para a pasta certa."
+        )
+    esperado = (args.volume_size,) * 3
+    if volume != esperado:
+        raise RuntimeError(
+            f"{processed_dir} tem volumes {volume}, e nao {esperado}. Rode 'preprocess' "
+            f"com --force-preprocess, ajuste --volume-size ou aponte --processed-dir "
+            f"para a pasta certa."
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1881,21 +1734,8 @@ def main(argv=None):
     ckpt = args.checkpoint or best_ckpt or find_checkpoint(hparams["experiment_dir"])
     trained = load_trained(ckpt, device)
 
-    # Daqui para baixo a saida vai para a tela E para uma copia, que no fim
-    # vira o results.txt do experimento (ver save_results). O tqdm escreve em
-    # stderr, entao as barras de progresso nao entram na copia.
-    tee = TeeText(sys.stdout)
-    with contextlib.redirect_stdout(tee):
-        run_eval_and_test(trained, data_module, device, args, threshold=args.threshold)
-
-    caminho = save_results(tee.getvalue(), hparams["experiment_dir"])
-    if caminho is not None:
-        print(f"\nResultados: {caminho}")
-
-
-def run_eval_and_test(trained, data_module, device, args, threshold):
-    """Estagios 3 e 4: validacao (com escolha do threshold) e teste."""
     # ---- 3. Validacao: predicoes, figuras e escolha do threshold ---------
+    threshold = args.threshold
     if "eval" in args.stages:
         tgts_np, preds_np = predict_split(
             trained, data_module.val, device, "val", args.figures_dir,

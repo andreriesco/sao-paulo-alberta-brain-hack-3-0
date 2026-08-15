@@ -7,3 +7,7 @@ Example_HCP*
 logs
 
 preprocessed_cc*
+
+fsl_fast_wm
+
+__pycache__
